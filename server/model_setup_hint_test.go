@@ -208,6 +208,20 @@ func TestIndexInitDataCarriesUserEmail(t *testing.T) {
 	}
 }
 
+func TestIndexInitDataUsesCoderProxyHostname(t *testing.T) {
+	t.Setenv("VSCODE_PROXY_URI", "https://{{port}}--workspace--lavender-hummingbird-52--serickson.coder.dreamlab.ucsb.edu")
+	srv, _, _ := newTestServer(t)
+	srv.listenPort = 9000
+	init := indexInitData(t, srv)
+	want := "9000--workspace--lavender-hummingbird-52--serickson.coder.dreamlab.ucsb.edu"
+	if got := init["hostname"]; got != want {
+		t.Fatalf("hostname = %#v, want %q", got, want)
+	}
+	if got := srv.publicURL("/c/demo"); got != "https://"+want+"/c/demo" {
+		t.Fatalf("publicURL = %q, want %q", got, "https://"+want+"/c/demo")
+	}
+}
+
 func TestIndexInitDataLinksToVMManagement(t *testing.T) {
 	if !isExeDev() {
 		t.Skip("VM management links are only provided on exe.dev")
