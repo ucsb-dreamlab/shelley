@@ -126,14 +126,16 @@ type Built struct {
 const (
 	TranscriptionTextModel       = "gpt-transcribe"
 	TranscriptionTimestampsModel = "whisper-1"
+	TranscriptionGeminiAlias     = "gemini-3.8-flash"
 )
 
 // TranscriptionModel is a known OpenAI-compatible transcription route.
 type TranscriptionModel struct {
-	Model    string
-	Endpoint string
-	APIKey   string
-	Source   string
+	Model     string
+	WireModel string
+	Endpoint  string
+	APIKey    string
+	Source    string
 	// FromCredentials marks a route derived from OpenAI credentials (env key
 	// or gateway). Integration and custom routes take precedence over it.
 	FromCredentials bool
@@ -846,6 +848,20 @@ func (m *Manager) GetTranscriptionModels(modelName string) ([]TranscriptionModel
 			APIKey:   model.ApiKey,
 			Source:   SourceCustomLabel,
 		})
+	}
+	if modelName == TranscriptionTextModel || modelName == TranscriptionTimestampsModel {
+		for _, model := range dbModels {
+			if model.ModelName != TranscriptionGeminiAlias || (model.ProviderType != "openai" && model.ProviderType != "openai-responses") {
+				continue
+			}
+			result = append(result, TranscriptionModel{
+				Model:     modelName,
+				WireModel: model.ModelName,
+				Endpoint:  strings.TrimSuffix(model.Endpoint, "/") + "/chat/completions",
+				APIKey:    model.ApiKey,
+				Source:    SourceCustomLabel,
+			})
+		}
 	}
 	return result, nil
 }

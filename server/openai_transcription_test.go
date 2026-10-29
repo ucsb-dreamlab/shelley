@@ -585,3 +585,53 @@ func TestOpenAIRecordingTranscriberRejectsStillOversizedPreparedAudio(t *testing
 		t.Fatalf("rejected prepared audio was not removed: %v", err)
 	}
 }
+
+func TestOpenAIRecordingTranscriberGeminiAliasWithTimestamps(t *testing.T) {
+	mediaPath := transcriptionTestFile(t, "gemini-screen.webm")
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer litellm-secret" {
+			t.Errorf("authorization = %q", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), `"json_object"`) {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"text\":\"gemini words\",\"words\":[{\"word\":\"gemini\",\"start\":0.1,\"end\":0.5}],\"segments\":[{\"start\":0.1,\"end\":0.9}]}"}}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"gemini words"}}]}`)
+	}))
+	defer api.Close()
+
+	transcriber := &openAIRecordingTranscriber{
+		client: api.Client(),
+		resolveModel: func(modelName string) (models.TranscriptionModel, error) {
+			return models.TranscriptionModel{
+				Model:     modelName,
+				WireModel: models.TranscriptionGeminiAlias,
+				Endpoint:  api.URL + "/v1/chat/completions",
+				APIKey:    "litellm-secret",
+			}, nil
+		},
+	}
+	result, err := transcriber.Transcribe(t.Context(), mediaPath, "Shelley on example-vm", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "gemini words" || result.Model != models.TranscriptionTextModel || result.TimestampsModel != models.TranscriptionTimestampsModel {
+		t.Fatalf("result = %#v", result)
+	}
+	timestamps, err := os.ReadFile(result.TimestampsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(timestamps), `"words"`) || !strings.Contains(string(timestamps), `"segments"`) {
+		t.Fatalf("timestamps = %s", timestamps)
+	}
+}
+
