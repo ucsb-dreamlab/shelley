@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1707,8 +1708,25 @@ func (s *Server) notifyConversationListChanged() {
 	}
 }
 
+// coderProxyHostname resolves the Coder proxy hostname for port from
+// VSCODE_PROXY_URI (e.g. "https://{{port}}--workspace--vm--user.coder.example.com").
+func coderProxyHostname(port int) string {
+	uri := strings.TrimSpace(os.Getenv("VSCODE_PROXY_URI"))
+	if uri == "" || port <= 0 {
+		return ""
+	}
+	expanded := strings.ReplaceAll(uri, "{{port}}", strconv.Itoa(port))
+	if u, err := url.Parse(expanded); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return ""
+}
+
 // publicHostname returns the server's public hostname.
-func publicHostname() string {
+func (s *Server) publicHostname() string {
+	if h := coderProxyHostname(s.listenPort); h != "" {
+		return h
+	}
 	if h, err := os.Hostname(); err == nil {
 		if !strings.Contains(h, ".") {
 			return h + ".exe.xyz"
@@ -1728,7 +1746,10 @@ func (s *Server) conversationURL(slug string) string {
 
 // publicURL returns the absolute URL of path on the server's public address.
 func (s *Server) publicURL(path string) string {
-	hostname := publicHostname()
+	if h := coderProxyHostname(s.listenPort); h != "" {
+		return fmt.Sprintf("https://%s%s", h, path)
+	}
+	hostname := s.publicHostname()
 	if s.listenPort == 443 || s.listenPort == 0 {
 		return fmt.Sprintf("https://%s%s", hostname, path)
 	}
@@ -1992,7 +2013,7 @@ func (s *Server) sendTurnEnd(ctx context.Context, conv *generated.Conversation, 
 	hooks = withExeNotifyHook(hooks, s.exeNotifyEnabled(ctx))
 
 	slug := derefString(conv.Slug)
-	hostname := publicHostname()
+	hostname := s.publicHostname()
 	payload := notifications.AgentDonePayload{
 		Hostname:          hostname,
 		Model:             model,
