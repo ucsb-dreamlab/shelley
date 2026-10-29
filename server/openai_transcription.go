@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -269,6 +270,9 @@ func (t *openAIRecordingTranscriber) transcribe(ctx context.Context, mediaPath, 
 	if err != nil {
 		return transcriptionAPIResponse{}, err
 	}
+	if model.WireModel != "" {
+		return t.transcribeChatCompletion(ctx, model, mediaPath, prompt, options)
+	}
 	media, err := os.Open(mediaPath)
 	if err != nil {
 		return transcriptionAPIResponse{}, fmt.Errorf("open recording: %w", err)
@@ -305,10 +309,110 @@ func (t *openAIRecordingTranscriber) transcribe(ctx context.Context, mediaPath, 
 	return t.request(ctx, model, writer.FormDataContentType(), body.Bytes(), options.ResponseFormat != "verbose_json")
 }
 
-func (t *openAIRecordingTranscriber) request(ctx context.Context, model models.TranscriptionModel, contentType string, body []byte, requireText bool) (transcriptionAPIResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, model.Endpoint, bytes.NewReader(body))
+func (t *openAIRecordingTranscriber) transcribeChatCompletion(ctx context.Context, model models.TranscriptionModel, mediaPath, prompt string, options transcriptionAPIOptions) (transcriptionAPIResponse, error) {
+	audioBytes, err := os.ReadFile(mediaPath)
+	if err != nil {
+		return transcriptionAPIResponse{}, fmt.Errorf("open recording: %w", err)
+	}
+	format := strings.TrimPrefix(strings.ToLower(filepath.Ext(mediaPath)), ".")
+	if format == "" {
+		format = "wav"
+	}
+	userPrompt := prompt + "\n\nOutput only the raw transcript text, with no commentary or formatting."
+	if options.ResponseFormat == "verbose_json" {
+		userPrompt = prompt + "\n\nReturn a JSON object with keys \"text\" (full transcript string), \"segments\" (array of {\"start\": number, \"end\": number} in seconds), and \"words\" (array of {\"word\": string, \"start\": number, \"end\": number} in seconds)."
+	}
+	payload := map[string]any{
+		"model": model.WireModel,
+		"messages": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "text", "text": userPrompt},
+				{"type": "input_audio", "input_audio": map[string]string{
+					"data":   base64.StdEncoding.EncodeToString(audioBytes),
+					"format": format,
+				}},
+			},
+		}},
+	}
+	if options.ResponseFormat == "verbose_json" {
+		payload["response_format"] = map[string]string{"type": "json_object"}
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return transcriptionAPIResponse{}, err
+	}
+	responseBody, err := t.sendRequest(ctx, model, "application/json", body)
+	if err != nil {
+		return transcriptionAPIResponse{}, err
+	}
+	var completion struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(responseBody, &completion); err != nil {
+		return transcriptionAPIResponse{}, fmt.Errorf("decode OpenAI transcription response: %w", err)
+	}
+	var content string
+	if len(completion.Choices) > 0 {
+		content = strings.TrimSpace(completion.Choices[0].Message.Content)
+	}
+	if options.ResponseFormat == "verbose_json" {
+		content = stripJSONCodeFence(content)
+		var decoded struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(content), &decoded); err != nil {
+			return transcriptionAPIResponse{}, fmt.Errorf("decode OpenAI transcription response: %w", err)
+		}
+		return transcriptionAPIResponse{Text: strings.TrimSpace(decoded.Text), Body: []byte(content)}, nil
+	}
+	if content == "" {
+		return transcriptionAPIResponse{}, errors.New("OpenAI transcription returned an empty transcript")
+	}
+	encoded, err := json.Marshal(map[string]string{"text": content})
+	if err != nil {
+		return transcriptionAPIResponse{}, err
+	}
+	return transcriptionAPIResponse{Text: content, Body: encoded}, nil
+}
+
+func stripJSONCodeFence(s string) string {
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	if newline := strings.IndexByte(s, '\n'); newline >= 0 {
+		s = s[newline+1:]
+	}
+	s = strings.TrimSuffix(strings.TrimSpace(s), "```")
+	return strings.TrimSpace(s)
+}
+
+func (t *openAIRecordingTranscriber) request(ctx context.Context, model models.TranscriptionModel, contentType string, body []byte, requireText bool) (transcriptionAPIResponse, error) {
+	responseBody, err := t.sendRequest(ctx, model, contentType, body)
+	if err != nil {
+		return transcriptionAPIResponse{}, err
+	}
+	var decoded struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(responseBody, &decoded); err != nil {
+		return transcriptionAPIResponse{}, fmt.Errorf("decode OpenAI transcription response: %w", err)
+	}
+	decoded.Text = strings.TrimSpace(decoded.Text)
+	if requireText && decoded.Text == "" {
+		return transcriptionAPIResponse{}, errors.New("OpenAI transcription returned an empty transcript")
+	}
+	return transcriptionAPIResponse{Text: decoded.Text, Body: responseBody}, nil
+}
+
+func (t *openAIRecordingTranscriber) sendRequest(ctx context.Context, model models.TranscriptionModel, contentType string, body []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, model.Endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
 	if model.APIKey != "" && model.APIKey != "implicit" {
@@ -317,16 +421,16 @@ func (t *openAIRecordingTranscriber) request(ctx context.Context, model models.T
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return transcriptionAPIResponse{}, fmt.Errorf("OpenAI transcription request: %w", err)
+		return nil, fmt.Errorf("OpenAI transcription request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxTranscriptionResponse+1))
 	if err != nil {
-		return transcriptionAPIResponse{}, fmt.Errorf("read OpenAI transcription response: %w", err)
+		return nil, fmt.Errorf("read OpenAI transcription response: %w", err)
 	}
 	if len(responseBody) > maxTranscriptionResponse {
-		return transcriptionAPIResponse{}, errors.New("OpenAI transcription response exceeded 16 MiB")
+		return nil, errors.New("OpenAI transcription response exceeded 16 MiB")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errorBody := responseBody
@@ -345,22 +449,11 @@ func (t *openAIRecordingTranscriber) request(ctx context.Context, model models.T
 		if message == "" {
 			message = resp.Status
 		}
-		return transcriptionAPIResponse{}, &transcriptionHTTPError{
+		return nil, &transcriptionHTTPError{
 			StatusCode: resp.StatusCode,
 			Status:     resp.Status,
 			Message:    message,
 		}
 	}
-
-	var decoded struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(responseBody, &decoded); err != nil {
-		return transcriptionAPIResponse{}, fmt.Errorf("decode OpenAI transcription response: %w", err)
-	}
-	decoded.Text = strings.TrimSpace(decoded.Text)
-	if requireText && decoded.Text == "" {
-		return transcriptionAPIResponse{}, errors.New("OpenAI transcription returned an empty transcript")
-	}
-	return transcriptionAPIResponse{Text: decoded.Text, Body: responseBody}, nil
+	return responseBody, nil
 }

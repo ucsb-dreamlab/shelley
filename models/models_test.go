@@ -739,6 +739,41 @@ func TestGetTranscriptionModelsIncludesIntegrationAndCustomRoutes(t *testing.T) 
 	}
 }
 
+func TestGetTranscriptionModelsAliasesGemini38Flash(t *testing.T) {
+	testDB, err := db.New(db.Config{DSN: t.TempDir() + "/test.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testDB.Close()
+	if err := testDB.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.CreateModel(t.Context(), generated.CreateModelParams{
+		ModelID:      "gemini-3-8-flash",
+		DisplayName:  "Gemini 3.8 Flash",
+		ProviderType: "openai",
+		Endpoint:     "https://litellm.example.com/v1",
+		ApiKey:       "litellm-key",
+		ModelName:    "gemini-3.8-flash",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := NewManager(&Config{DB: testDB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{TranscriptionTextModel, TranscriptionTimestampsModel} {
+		got, err := mgr.GetTranscriptionModels(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Model != name || got[0].WireModel != "gemini-3.8-flash" || got[0].Endpoint != "https://litellm.example.com/v1/chat/completions" {
+			t.Fatalf("GetTranscriptionModels(%q) = %+v", name, got)
+		}
+	}
+}
+
 func (m *mockLLMService) SupportsImages() bool { return true }
 
 func TestManagerLoadsCustomReasoningReplayOverride(t *testing.T) {
