@@ -117,11 +117,16 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 		content := gemini.Content{
 			Role: role,
 		}
+		var trailingUserParts []gemini.Part
+		hasToolResult := false
 
-		// First pass: collect tool use IDs for correlation
+		// First pass: collect tool use IDs for correlation and detect tool results
 		for _, c := range msg.Content {
 			if c.Type == llm.ContentTypeToolUse && c.ID != "" {
 				toolNamesByID[c.ID] = c.ToolName
+			}
+			if c.Type == llm.ContentTypeToolResult {
+				hasToolResult = true
 			}
 		}
 
@@ -151,12 +156,17 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 			case llm.ContentTypeText, llm.ContentTypeThinking, llm.ContentTypeRedactedThinking:
 				// Image content is represented as ContentTypeText with MediaType + Data set.
 				if c.Type == llm.ContentTypeText && c.MediaType != "" && c.Data != "" {
-					content.Parts = append(content.Parts, gemini.Part{
+					imgPart := gemini.Part{
 						InlineData: &gemini.Blob{
 							MimeType: c.MediaType,
 							Data:     c.Data,
 						},
-					})
+					}
+					if hasToolResult && role == "user" {
+						trailingUserParts = append(trailingUserParts, imgPart)
+					} else {
+						content.Parts = append(content.Parts, imgPart)
+					}
 					continue
 				}
 				// Text or thinking content
@@ -177,7 +187,11 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 					part.Text = c.Text
 					part.ThoughtSignature = c.Signature
 				}
-				content.Parts = append(content.Parts, part)
+				if hasToolResult && role == "user" {
+					trailingUserParts = append(trailingUserParts, part)
+				} else {
+					content.Parts = append(content.Parts, part)
+				}
 			case llm.ContentTypeToolUse:
 				// Tool use becomes a function call
 				var args map[string]any
@@ -251,10 +265,11 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 				})
 
 				// Images inside tool results aren't supported in FunctionResponse,
-				// so we attach them as additional inlineData parts on the same content.
+				// and Vertex AI / LiteLLM reject mixing FunctionResponse and InlineData
+				// parts in the same Content turn. Emit them in a trailing user Content turn.
 				for _, result := range c.ToolResult {
 					if result.MediaType != "" && result.Data != "" {
-						content.Parts = append(content.Parts, gemini.Part{
+						trailingUserParts = append(trailingUserParts, gemini.Part{
 							InlineData: &gemini.Blob{
 								MimeType: result.MediaType,
 								Data:     result.Data,
@@ -267,6 +282,12 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 
 		if len(content.Parts) > 0 {
 			gemReq.Contents = append(gemReq.Contents, content)
+		}
+		if len(trailingUserParts) > 0 {
+			gemReq.Contents = append(gemReq.Contents, gemini.Content{
+				Role:  "user",
+				Parts: trailingUserParts,
+			})
 		}
 	}
 
