@@ -178,6 +178,9 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 		}
 	}
 
+	// Store tool usage information to correlate tool uses with responses across messages.
+	toolIDToName := make(map[string]string)
+
 	// Convert messages to Gemini content format
 	for _, msg := range req.Messages {
 		// Set the role based on the message role
@@ -189,14 +192,12 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 		content := gemini.Content{
 			Role: role,
 		}
-
-		// Store tool usage information to correlate tool uses with responses
-		toolNameToID := make(map[string]string)
-
-		// First pass: collect tool use IDs for correlation
+		var trailingUserParts []gemini.Part
+		hasToolResult := false
 		for _, c := range msg.Content {
-			if c.Type == llm.ContentTypeToolUse && c.ID != "" {
-				toolNameToID[c.ToolName] = c.ID
+			if c.Type == llm.ContentTypeToolResult {
+				hasToolResult = true
+				break
 			}
 		}
 
@@ -209,12 +210,17 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 			case llm.ContentTypeText, llm.ContentTypeThinking, llm.ContentTypeRedactedThinking:
 				// Image content is represented as ContentTypeText with MediaType + Data set.
 				if c.Type == llm.ContentTypeText && c.MediaType != "" && c.Data != "" {
-					content.Parts = append(content.Parts, gemini.Part{
+					imgPart := gemini.Part{
 						InlineData: &gemini.Blob{
 							MimeType: c.MediaType,
 							Data:     c.Data,
 						},
-					})
+					}
+					if hasToolResult && role == "user" {
+						trailingUserParts = append(trailingUserParts, imgPart)
+					} else {
+						content.Parts = append(content.Parts, imgPart)
+					}
 					continue
 				}
 				// Text or thinking content
@@ -235,7 +241,11 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 					part.Text = c.Text
 					part.ThoughtSignature = c.Signature
 				}
-				content.Parts = append(content.Parts, part)
+				if hasToolResult && role == "user" {
+					trailingUserParts = append(trailingUserParts, part)
+				} else {
+					content.Parts = append(content.Parts, part)
+				}
 			case llm.ContentTypeToolUse:
 				// Tool use becomes a function call
 				var args map[string]any
@@ -248,8 +258,8 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 					c.ID = fmt.Sprintf("gemini_tool_%s_%d", c.ToolName, time.Now().UnixNano())
 				}
 
-				// Save the ID for this tool name for future correlation
-				toolNameToID[c.ToolName] = c.ID
+				// Save the tool name for this tool ID for correlation with subsequent tool results
+				toolIDToName[c.ID] = c.ToolName
 
 				slog.DebugContext(context.Background(), "gemini_preparing_tool_use",
 					"tool_name", c.ToolName,
@@ -292,13 +302,7 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 
 				// First try to find the function name from a stored toolUseID if we have one
 				if c.ToolUseID != "" {
-					// Try to derive the tool name from the previous tools we've seen
-					for name, id := range toolNameToID {
-						if id == c.ToolUseID {
-							funcName = name
-							break
-						}
-					}
+					funcName = toolIDToName[c.ToolUseID]
 				}
 
 				// Fallback options if we couldn't find the tool name
@@ -325,10 +329,11 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 				})
 
 				// Images inside tool results aren't supported in FunctionResponse,
-				// so we attach them as additional inlineData parts on the same content.
+				// and Vertex AI / LiteLLM reject mixing FunctionResponse and InlineData
+				// parts in the same Content turn. Emit them in a trailing user Content turn.
 				for _, result := range c.ToolResult {
 					if result.MediaType != "" && result.Data != "" {
-						content.Parts = append(content.Parts, gemini.Part{
+						trailingUserParts = append(trailingUserParts, gemini.Part{
 							InlineData: &gemini.Blob{
 								MimeType: result.MediaType,
 								Data:     result.Data,
@@ -340,6 +345,12 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 		}
 
 		gemReq.Contents = append(gemReq.Contents, content)
+		if len(trailingUserParts) > 0 {
+			gemReq.Contents = append(gemReq.Contents, gemini.Content{
+				Role:  "user",
+				Parts: trailingUserParts,
+			})
+		}
 	}
 
 	// Handle tools/functions

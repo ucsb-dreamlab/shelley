@@ -1288,24 +1288,41 @@ func TestBuildGeminiRequestImageInToolResult(t *testing.T) {
 		Messages: []llm.Message{
 			{
 				Role: llm.MessageRoleAssistant,
-				Content: []llm.Content{{
-					ID:        "tool_1",
-					Type:      llm.ContentTypeToolUse,
-					ToolName:  "screenshot",
-					ToolInput: json.RawMessage(`{}`),
-				}},
+				Content: []llm.Content{
+					{
+						ID:        "tool_1",
+						Type:      llm.ContentTypeToolUse,
+						ToolName:  "browser",
+						ToolInput: json.RawMessage(`{"action":"resize"}`),
+					},
+					{
+						ID:        "tool_2",
+						Type:      llm.ContentTypeToolUse,
+						ToolName:  "browser",
+						ToolInput: json.RawMessage(`{"action":"screenshot"}`),
+					},
+				},
 			},
 			{
 				Role: llm.MessageRoleUser,
-				Content: []llm.Content{{
-					Type:      llm.ContentTypeToolResult,
-					ToolUseID: "tool_1",
-					ToolName:  "screenshot",
-					ToolResult: []llm.Content{
-						{Type: llm.ContentTypeText, Text: "screenshot taken"},
-						{Type: llm.ContentTypeText, MediaType: "image/png", Data: "BBBB"},
+				Content: []llm.Content{
+					{
+						Type:      llm.ContentTypeToolResult,
+						ToolUseID: "tool_1",
+						// ToolName intentionally omitted to verify cross-message toolIDToName correlation
+						ToolResult: []llm.Content{
+							{Type: llm.ContentTypeText, Text: "done"},
+						},
 					},
-				}},
+					{
+						Type:      llm.ContentTypeToolResult,
+						ToolUseID: "tool_2",
+						ToolResult: []llm.Content{
+							{Type: llm.ContentTypeText, Text: "screenshot taken"},
+							{Type: llm.ContentTypeText, MediaType: "image/png", Data: "BBBB"},
+						},
+					},
+				},
 			},
 		},
 	}
@@ -1313,18 +1330,24 @@ func TestBuildGeminiRequestImageInToolResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(gemReq.Contents) != 2 {
-		t.Fatalf("expected 2 contents, got %d", len(gemReq.Contents))
+	if len(gemReq.Contents) != 3 {
+		t.Fatalf("expected 3 contents (model functionCalls, user functionResponses, user inlineData), got %d: %+v", len(gemReq.Contents), gemReq.Contents)
 	}
-	parts := gemReq.Contents[1].Parts
-	if len(parts) != 2 {
-		t.Fatalf("expected tool-result content with 2 parts (functionResponse + inlineData), got %d: %+v", len(parts), parts)
+	fnRespParts := gemReq.Contents[1].Parts
+	if len(fnRespParts) != 2 {
+		t.Fatalf("expected 2 functionResponse parts, got %d: %+v", len(fnRespParts), fnRespParts)
 	}
-	if parts[0].FunctionResponse == nil || parts[0].FunctionResponse.Name != "screenshot" {
-		t.Errorf("part 0 functionResponse = %+v", parts[0].FunctionResponse)
+	for i, part := range fnRespParts {
+		if part.FunctionResponse == nil || part.FunctionResponse.Name != "browser" {
+			t.Errorf("part %d functionResponse = %+v, want name 'browser'", i, part.FunctionResponse)
+		}
 	}
-	if parts[1].InlineData == nil || parts[1].InlineData.MimeType != "image/png" || parts[1].InlineData.Data != "BBBB" {
-		t.Errorf("part 1 inlineData = %+v", parts[1].InlineData)
+	imgParts := gemReq.Contents[2].Parts
+	if gemReq.Contents[2].Role != "user" || len(imgParts) != 1 {
+		t.Fatalf("expected trailing user content with 1 inlineData part, got %+v", gemReq.Contents[2])
+	}
+	if imgParts[0].InlineData == nil || imgParts[0].InlineData.MimeType != "image/png" || imgParts[0].InlineData.Data != "BBBB" {
+		t.Errorf("trailing part 0 inlineData = %+v", imgParts[0].InlineData)
 	}
 }
 
