@@ -146,14 +146,16 @@ const (
 	TranscriptionTextModel       = "gpt-transcribe"
 	TranscriptionDeepgramModel   = "nova-3"
 	TranscriptionTimestampsModel = "whisper-1"
+	TranscriptionGeminiAlias     = "gemini-3.5-transcribe"
 )
 
 // TranscriptionModel is a known transcription route.
 type TranscriptionModel struct {
-	Model    string
-	Endpoint string
-	APIKey   string
-	Source   string
+	Model     string
+	WireModel string
+	Endpoint  string
+	APIKey    string
+	Source    string
 	// FromCredentials marks a route derived from OpenAI credentials (env key
 	// or gateway). Integration and custom routes take precedence over it.
 	FromCredentials bool
@@ -831,7 +833,42 @@ func (m *Manager) GetTranscriptionModels(modelName string) ([]TranscriptionModel
 			Source:   SourceCustomLabel,
 		})
 	}
+	if modelName == TranscriptionTextModel || modelName == TranscriptionTimestampsModel {
+		seen := make(map[string]bool)
+		for _, matchProvider := range []bool{false, true} {
+			for _, model := range dbModels {
+				if !matchProvider {
+					if model.ModelName != TranscriptionGeminiAlias {
+						continue
+					}
+				} else if model.ProviderType != "gemini" {
+					continue
+				}
+				endpoint := geminiTranscriptionEndpoint(model.Endpoint, TranscriptionGeminiAlias)
+				if seen[endpoint] {
+					continue
+				}
+				seen[endpoint] = true
+				result = append(result, TranscriptionModel{
+					Model:     modelName,
+					WireModel: TranscriptionGeminiAlias,
+					Endpoint:  endpoint,
+					APIKey:    model.ApiKey,
+					Source:    SourceCustomLabel,
+				})
+			}
+		}
+	}
 	return result, nil
+}
+
+func geminiTranscriptionEndpoint(endpoint, wireModel string) string {
+	base := strings.TrimRight(endpoint, "/")
+	base = strings.TrimSuffix(base, "/v1")
+	if !strings.HasSuffix(base, "/v1beta") {
+		base += "/v1beta"
+	}
+	return base + "/models/" + wireModel + ":generateContent"
 }
 
 func (m *Manager) HasModel(modelID string) bool {
