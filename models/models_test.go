@@ -739,6 +739,42 @@ func TestGetTranscriptionModelsIncludesIntegrationAndCustomRoutes(t *testing.T) 
 	}
 }
 
+func TestGetTranscriptionModelsAliasesGemini35Transcribe(t *testing.T) {
+	testDB, err := db.New(db.Config{DSN: t.TempDir() + "/test.db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer testDB.Close()
+	if err := testDB.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.CreateModel(t.Context(), generated.CreateModelParams{
+		ModelID:      "gemini-4-argon",
+		DisplayName:  "Gemini 4 Argon",
+		ProviderType: "gemini",
+		Endpoint:     "https://litellm.example.com/v1beta",
+		ApiKey:       "litellm-key",
+		ModelName:    "gemini-4-argon",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := NewManager(&Config{DB: testDB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEndpoint := "https://litellm.example.com/v1beta/models/gemini-3.5-transcribe:generateContent"
+	for _, name := range []string{TranscriptionTextModel, TranscriptionTimestampsModel} {
+		got, err := mgr.GetTranscriptionModels(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Model != name || got[0].WireModel != "gemini-3.5-transcribe" || got[0].Endpoint != wantEndpoint {
+			t.Fatalf("GetTranscriptionModels(%q) = %+v", name, got)
+		}
+	}
+}
+
 func (m *mockLLMService) SupportsImages() bool { return true }
 
 func TestManagerLoadsCustomReasoningReplayOverride(t *testing.T) {

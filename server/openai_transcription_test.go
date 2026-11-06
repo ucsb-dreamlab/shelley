@@ -585,3 +585,53 @@ func TestOpenAIRecordingTranscriberRejectsStillOversizedPreparedAudio(t *testing
 		t.Fatalf("rejected prepared audio was not removed: %v", err)
 	}
 }
+
+func TestOpenAIRecordingTranscriberGeminiAliasWithTimestamps(t *testing.T) {
+	mediaPath := transcriptionTestFile(t, "gemini-screen.webm")
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1beta/models/gemini-3.5-transcribe:generateContent" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer litellm-secret" {
+			t.Errorf("authorization = %q", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), `"wordTimestamp":true`) {
+			_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"gemini words.","audioTranscription":{"text":"gemini words.","words":[{"word":"gemini","startOffset":"0.100s","endOffset":"0.500s"},{"word":"words.","startOffset":"0.500s","endOffset":"0.900s"}]}}]}}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"gemini words.","audioTranscription":{"text":"gemini words."}}]}}]}`)
+	}))
+	defer api.Close()
+
+	transcriber := &openAIRecordingTranscriber{
+		client: api.Client(),
+		resolveModel: func(modelName string) (models.TranscriptionModel, error) {
+			return models.TranscriptionModel{
+				Model:     modelName,
+				WireModel: models.TranscriptionGeminiAlias,
+				Endpoint:  api.URL + "/v1beta/models/" + models.TranscriptionGeminiAlias + ":generateContent",
+				APIKey:    "litellm-secret",
+			}, nil
+		},
+	}
+	result, err := transcriber.Transcribe(t.Context(), mediaPath, "Shelley on example-vm", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "gemini words." || result.Model != models.TranscriptionTextModel || result.TimestampsModel != models.TranscriptionTimestampsModel {
+		t.Fatalf("result = %#v", result)
+	}
+	timestamps, err := os.ReadFile(result.TimestampsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(timestamps), `"words"`) || !strings.Contains(string(timestamps), `"segments"`) {
+		t.Fatalf("timestamps = %s", timestamps)
+	}
+}
+
