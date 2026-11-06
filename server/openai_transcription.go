@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
@@ -373,6 +375,9 @@ func (t *openAIRecordingTranscriber) transcribe(ctx context.Context, mediaPath, 
 	if err != nil {
 		return transcriptionAPIResponse{}, err
 	}
+	if model.WireModel != "" {
+		return t.transcribeGemini(ctx, model, mediaPath, options)
+	}
 	media, err := os.Open(mediaPath)
 	if err != nil {
 		return transcriptionAPIResponse{}, fmt.Errorf("open recording: %w", err)
@@ -422,6 +427,164 @@ func (t *openAIRecordingTranscriber) transcribe(ctx context.Context, mediaPath, 
 		return transcriptionAPIResponse{}, errors.New("OpenAI transcription returned an empty transcript")
 	}
 	return transcriptionAPIResponse{Text: decoded.Text, Body: responseBody}, nil
+}
+
+func (t *openAIRecordingTranscriber) transcribeGemini(ctx context.Context, model models.TranscriptionModel, mediaPath string, options transcriptionAPIOptions) (transcriptionAPIResponse, error) {
+	audioBytes, err := os.ReadFile(mediaPath)
+	if err != nil {
+		return transcriptionAPIResponse{}, fmt.Errorf("open recording: %w", err)
+	}
+	audioConfig := map[string]any{
+		"mode": "VERBATIM",
+	}
+	if options.ResponseFormat == "verbose_json" {
+		audioConfig["wordTimestamp"] = true
+	}
+	payload := map[string]any{
+		"contents": []map[string]any{{
+			"role": "user",
+			"parts": []map[string]any{{
+				"inlineData": map[string]string{
+					"mimeType": audioMimeType(mediaPath),
+					"data":     base64.StdEncoding.EncodeToString(audioBytes),
+				},
+			}},
+		}},
+		"generationConfig": map[string]any{
+			"audioTranscriptionConfig": audioConfig,
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return transcriptionAPIResponse{}, err
+	}
+	responseBody, err := t.post(ctx, model, "application/json", body)
+	if err != nil {
+		return transcriptionAPIResponse{}, err
+	}
+	var geminiResp struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text               string `json:"text"`
+					AudioTranscription *struct {
+						Text        string `json:"text"`
+						StartOffset string `json:"startOffset"`
+						EndOffset   string `json:"endOffset"`
+						Words       []struct {
+							Word        string `json:"word"`
+							StartOffset string `json:"startOffset"`
+							EndOffset   string `json:"endOffset"`
+						} `json:"words"`
+					} `json:"audioTranscription"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+	}
+	if err := json.Unmarshal(responseBody, &geminiResp); err != nil {
+		return transcriptionAPIResponse{}, fmt.Errorf("decode Gemini transcription response: %w", err)
+	}
+	var textParts []string
+	words := make([]timedWord, 0)
+	segments := make([]timedSegment, 0)
+	if len(geminiResp.Candidates) > 0 {
+		for _, part := range geminiResp.Candidates[0].Content.Parts {
+			partText := strings.TrimSpace(part.Text)
+			if part.AudioTranscription != nil {
+				if atText := strings.TrimSpace(part.AudioTranscription.Text); atText != "" {
+					partText = atText
+				}
+				for _, w := range part.AudioTranscription.Words {
+					word := strings.TrimSpace(w.Word)
+					if word == "" {
+						continue
+					}
+					words = append(words, timedWord{
+						Word:  word,
+						Start: parseGeminiAudioOffset(w.StartOffset),
+						End:   parseGeminiAudioOffset(w.EndOffset),
+					})
+				}
+				if part.AudioTranscription.StartOffset != "" || part.AudioTranscription.EndOffset != "" {
+					segments = append(segments, timedSegment{
+						Start: parseGeminiAudioOffset(part.AudioTranscription.StartOffset),
+						End:   parseGeminiAudioOffset(part.AudioTranscription.EndOffset),
+					})
+				}
+			}
+			if partText != "" {
+				textParts = append(textParts, partText)
+			}
+		}
+	}
+	content := strings.TrimSpace(strings.Join(textParts, " "))
+	if options.ResponseFormat == "verbose_json" {
+		if len(segments) == 0 && len(words) > 0 {
+			segStart := words[0].Start
+			for i, w := range words {
+				last := i == len(words)-1
+				endsSentence := strings.HasSuffix(w.Word, ".") || strings.HasSuffix(w.Word, "!") || strings.HasSuffix(w.Word, "?")
+				if endsSentence || last {
+					segments = append(segments, timedSegment{Start: segStart, End: w.End})
+					if !last {
+						segStart = words[i+1].Start
+					}
+				}
+			}
+		}
+		encoded, err := json.Marshal(struct {
+			Text     string         `json:"text"`
+			Words    []timedWord    `json:"words"`
+			Segments []timedSegment `json:"segments"`
+		}{
+			Text:     content,
+			Words:    words,
+			Segments: segments,
+		})
+		if err != nil {
+			return transcriptionAPIResponse{}, err
+		}
+		return transcriptionAPIResponse{Text: content, Body: encoded}, nil
+	}
+	if content == "" {
+		return transcriptionAPIResponse{}, errors.New("OpenAI transcription returned an empty transcript")
+	}
+	encoded, err := json.Marshal(map[string]string{"text": content})
+	if err != nil {
+		return transcriptionAPIResponse{}, err
+	}
+	return transcriptionAPIResponse{Text: content, Body: encoded}, nil
+}
+
+func audioMimeType(mediaPath string) string {
+	switch strings.ToLower(filepath.Ext(mediaPath)) {
+	case ".wav":
+		return "audio/wav"
+	case ".mp3":
+		return "audio/mp3"
+	case ".m4a", ".mp4":
+		return "audio/mp4"
+	case ".aac":
+		return "audio/aac"
+	case ".ogg", ".opus":
+		return "audio/ogg"
+	case ".flac":
+		return "audio/flac"
+	default:
+		return "audio/webm"
+	}
+}
+
+func parseGeminiAudioOffset(s string) float64 {
+	s = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), "s"))
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 // post sends body to model's endpoint and returns the successful response
