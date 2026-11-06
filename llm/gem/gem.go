@@ -727,6 +727,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 		Endpoint: s.URL,
 		APIKey:   s.APIKey,
 		HTTPC:    cmp.Or(s.HTTPC, http.DefaultClient),
+		OnStream: ir.OnStream,
 	}
 
 	// Send the request to Gemini with retry logic

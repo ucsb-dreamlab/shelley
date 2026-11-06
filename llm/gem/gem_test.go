@@ -3,8 +3,11 @@ package gem
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1426,5 +1429,60 @@ func TestThinkingConfigRequestOverride(t *testing.T) {
 				t.Errorf("includeThoughts = %v, want %v (thought summaries are only returned when requested)", tc.IncludeThoughts, wantThoughts)
 			}
 		})
+	}
+}
+
+func TestServiceDoSSEStreaming(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range []string{
+			`{"candidates": [{"content": {"role": "model","parts": [{"thought": true, "text": "Reasoning..."}]}}]}`,
+			`{"candidates": [{"content": {"role": "model","parts": [{"text": "Hello "}]}}]}`,
+			`{"candidates": [{"content": {"role": "model","parts": [{"text": "world!"}]}}]}`,
+			`{"candidates": [{"content": {"role": "model","parts": [{"text": "", "thoughtSignature": "sig-123"}]}, "finishReason": "STOP"}]}`,
+		} {
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+		}
+	}))
+	defer server.Close()
+
+	svc := &Service{
+		Model:  "gemini-4-argon",
+		APIKey: "test-key",
+		URL:    server.URL,
+	}
+
+	var deltas []llm.StreamDelta
+	progress := 0
+	ctx := llm.WithProgress(t.Context(), func() { progress++ })
+
+	res, err := svc.Do(ctx, &llm.Request{
+		Messages: []llm.Message{llm.UserStringMessage("Say hello")},
+		OnStream: func(d llm.StreamDelta) {
+			deltas = append(deltas, d)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if progress != 4 {
+		t.Errorf("progress = %d, want 4", progress)
+	}
+	if len(res.Content) != 2 {
+		t.Fatalf("len(res.Content) = %d, want 2: %+v", len(res.Content), res.Content)
+	}
+	if res.Content[0].Type != llm.ContentTypeThinking || res.Content[0].Thinking != "Reasoning..." {
+		t.Errorf("Content[0] = %+v, want thinking 'Reasoning...'", res.Content[0])
+	}
+	if res.Content[1].Type != llm.ContentTypeText || res.Content[1].Text != "Hello world!" || res.Content[1].Signature != "sig-123" {
+		t.Errorf("Content[1] = %+v, want text 'Hello world!' with signature 'sig-123'", res.Content[1])
+	}
+	wantDeltas := []llm.StreamDelta{
+		{Type: "thinking", Text: "Reasoning...", Index: 0},
+		{Type: "text", Text: "Hello ", Index: 1},
+		{Type: "text", Text: "world!", Index: 1},
+	}
+	if !reflect.DeepEqual(deltas, wantDeltas) {
+		t.Errorf("deltas = %+v, want %+v", deltas, wantDeltas)
 	}
 }

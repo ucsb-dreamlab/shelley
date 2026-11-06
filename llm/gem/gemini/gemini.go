@@ -1,12 +1,16 @@
 package gemini
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+
+	"shelley.exe.dev/llm"
 )
 
 // https://ai.google.dev/api/generate-content#request-body
@@ -24,8 +28,17 @@ type Request struct {
 
 // https://ai.google.dev/api/generate-content#response-body
 type Response struct {
-	Candidates []Candidate `json:"candidates"`
-	headers    http.Header // captured HTTP response headers
+	Candidates    []Candidate    `json:"candidates"`
+	UsageMetadata *UsageMetadata `json:"usageMetadata,omitempty"`
+	headers       http.Header    // captured HTTP response headers
+}
+
+type UsageMetadata struct {
+	PromptTokenCount        int `json:"promptTokenCount,omitempty"`
+	CandidatesTokenCount    int `json:"candidatesTokenCount,omitempty"`
+	TotalTokenCount         int `json:"totalTokenCount,omitempty"`
+	ThoughtsTokenCount      int `json:"thoughtsTokenCount,omitempty"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount,omitempty"`
 }
 
 // Header returns the HTTP response headers.
@@ -34,7 +47,8 @@ func (r *Response) Header() http.Header {
 }
 
 type Candidate struct {
-	Content Content `json:"content"`
+	Content      Content `json:"content"`
+	FinishReason string  `json:"finishReason,omitempty"`
 }
 
 type Content struct {
@@ -184,8 +198,9 @@ func (e *APIError) Error() string {
 type Model struct {
 	Model    string // e.g. "models/gemini-1.5-flash"
 	APIKey   string
-	HTTPC    *http.Client // if nil, http.DefaultClient is used
-	Endpoint string       // if empty, DefaultEndpoint is used
+	HTTPC    *http.Client          // if nil, http.DefaultClient is used
+	Endpoint string                // if empty, DefaultEndpoint is used
+	OnStream func(llm.StreamDelta) // optional callback for streamed text/thinking deltas
 }
 
 func (m Model) GenerateContent(ctx context.Context, req *Request) (*Response, error) {
@@ -193,7 +208,7 @@ func (m Model) GenerateContent(ctx context.Context, req *Request) (*Response, er
 	if err != nil {
 		return nil, fmt.Errorf("marshaling request: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/%s:generateContent", m.endpoint(), m.Model), bytes.NewReader(reqBytes))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/%s:streamGenerateContent?alt=sse", m.endpoint(), m.Model), bytes.NewReader(reqBytes))
 	if err != nil {
 		return nil, fmt.Errorf("creating HTTP request: %w", err)
 	}
@@ -204,19 +219,211 @@ func (m Model) GenerateContent(ctx context.Context, req *Request) (*Response, er
 		return nil, fmt.Errorf("GenerateContent: do: %w", err)
 	}
 	defer httpResp.Body.Close()
-	body, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("GenerateContent: reading response body: %w", err)
-	}
 	if httpResp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(httpResp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("GenerateContent: reading response body: %w", err)
+		}
 		return nil, &APIError{StatusCode: httpResp.StatusCode, Body: string(body), Header: httpResp.Header}
 	}
-	var res Response
-	if err := json.Unmarshal(body, &res); err != nil {
-		return nil, fmt.Errorf("GenerateContent: unmarshaling response: %w, %s", err, string(body))
+	res, err := parseStreamResponse(ctx, httpResp.Body, m.OnStream)
+	if err != nil {
+		return nil, err
 	}
 	res.headers = httpResp.Header
-	return &res, nil
+	return res, nil
+}
+
+func parseStreamResponse(ctx context.Context, r io.Reader, onStream func(llm.StreamDelta)) (*Response, error) {
+	scanner := bufio.NewScanner(r)
+	// SSE lines can be large (e.g. tool call JSON or long thought/text chunks).
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	var (
+		merged        Response
+		dataLines     []string
+		fallbackLines []string
+		sawSSE        bool
+	)
+
+	processData := func(raw string) error {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || raw == "[DONE]" {
+			return nil
+		}
+		var chunk Response
+		if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+			return fmt.Errorf("GenerateContent: unmarshaling SSE chunk: %w, %s", err, raw)
+		}
+		llm.ReportProgress(ctx)
+		mergeResponseChunk(&merged, &chunk, onStream)
+		return nil
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if line == "" {
+			if len(dataLines) > 0 {
+				raw := strings.Join(dataLines, "\n")
+				dataLines = dataLines[:0]
+				if err := processData(raw); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			// SSE comment / keepalive
+			sawSSE = true
+			fallbackLines = nil
+			continue
+		}
+		if value, ok := strings.CutPrefix(line, "data:"); ok {
+			sawSSE = true
+			fallbackLines = nil
+			value = strings.TrimPrefix(value, " ")
+			dataLines = append(dataLines, value)
+			joined := strings.TrimSpace(strings.Join(dataLines, "\n"))
+			if joined == "[DONE]" {
+				dataLines = dataLines[:0]
+			} else if json.Valid([]byte(joined)) {
+				dataLines = dataLines[:0]
+				if err := processData(joined); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "id:") || strings.HasPrefix(line, "retry:") {
+			sawSSE = true
+			fallbackLines = nil
+			continue
+		}
+		if !sawSSE {
+			fallbackLines = append(fallbackLines, line)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("GenerateContent: reading response body: %w", err)
+	}
+
+	if len(dataLines) > 0 {
+		raw := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		if err := processData(raw); err != nil {
+			return nil, err
+		}
+	}
+
+	if !sawSSE {
+		body := strings.TrimSpace(strings.Join(fallbackLines, "\n"))
+		if body == "" {
+			return &merged, nil
+		}
+		var chunk Response
+		if err := json.Unmarshal([]byte(body), &chunk); err != nil {
+			return nil, fmt.Errorf("GenerateContent: unmarshaling response: %w, %s", err, body)
+		}
+		llm.ReportProgress(ctx)
+		merged = chunk
+		if onStream != nil && len(merged.Candidates) > 0 {
+			for idx, part := range merged.Candidates[0].Content.Parts {
+				if isTextOrSignatureOnly(part) && part.Text != "" {
+					deltaType := "text"
+					if part.Thought {
+						deltaType = "thinking"
+					}
+					onStream(llm.StreamDelta{Type: deltaType, Text: part.Text, Index: idx})
+				}
+			}
+		}
+	}
+
+	return &merged, nil
+}
+
+func isTextOrSignatureOnly(p Part) bool {
+	return p.FunctionCall == nil &&
+		p.FunctionResponse == nil &&
+		p.ExecutableCode == nil &&
+		p.CodeExecutionResult == nil &&
+		p.InlineData == nil
+}
+
+func mergeResponseChunk(merged *Response, chunk *Response, onStream func(llm.StreamDelta)) {
+	if chunk.UsageMetadata != nil {
+		merged.UsageMetadata = chunk.UsageMetadata
+	}
+	for i, cand := range chunk.Candidates {
+		for len(merged.Candidates) <= i {
+			merged.Candidates = append(merged.Candidates, Candidate{})
+		}
+		dst := &merged.Candidates[i]
+		if cand.Content.Role != "" {
+			dst.Content.Role = cand.Content.Role
+		}
+		if cand.FinishReason != "" {
+			dst.FinishReason = cand.FinishReason
+		}
+		for _, part := range cand.Content.Parts {
+			dst.Content.Parts = mergePart(dst.Content.Parts, part, i == 0, onStream)
+		}
+	}
+}
+
+func mergePart(parts []Part, part Part, isPrimaryCandidate bool, onStream func(llm.StreamDelta)) []Part {
+	if isTextOrSignatureOnly(part) {
+		if part.Text == "" && part.ThoughtSignature == "" {
+			return parts
+		}
+		if part.Text == "" && part.ThoughtSignature != "" {
+			if len(parts) > 0 {
+				parts[len(parts)-1].ThoughtSignature = part.ThoughtSignature
+				return parts
+			}
+			return append(parts, part)
+		}
+		if len(parts) > 0 {
+			prev := &parts[len(parts)-1]
+			if isTextOrSignatureOnly(*prev) && (prev.Text == "" || prev.Thought == part.Thought) {
+				prev.Text += part.Text
+				prev.Thought = part.Thought
+				if part.ThoughtSignature != "" {
+					prev.ThoughtSignature = part.ThoughtSignature
+				}
+				if isPrimaryCandidate && onStream != nil {
+					deltaType := "text"
+					if part.Thought {
+						deltaType = "thinking"
+					}
+					onStream(llm.StreamDelta{Type: deltaType, Text: part.Text, Index: len(parts) - 1})
+				}
+				return parts
+			}
+		}
+		parts = append(parts, part)
+		if isPrimaryCandidate && onStream != nil {
+			deltaType := "text"
+			if part.Thought {
+				deltaType = "thinking"
+			}
+			onStream(llm.StreamDelta{Type: deltaType, Text: part.Text, Index: len(parts) - 1})
+		}
+		return parts
+	}
+
+	if len(parts) > 0 {
+		prev := &parts[len(parts)-1]
+		if isTextOrSignatureOnly(*prev) && prev.Text == "" && prev.ThoughtSignature != "" {
+			if part.ThoughtSignature == "" {
+				part.ThoughtSignature = prev.ThoughtSignature
+			}
+			*prev = part
+			return parts
+		}
+	}
+	return append(parts, part)
 }
 
 func (m Model) endpoint() string {
