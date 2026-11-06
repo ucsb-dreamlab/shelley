@@ -1205,6 +1205,21 @@ func TestThinkingConfig(t *testing.T) {
 			wantLevel: "medium",
 		},
 		{
+			name:        "gemini-4-argon omitted by default",
+			svc:         &Service{Model: "gemini-4-argon", APIKey: "x"},
+			wantOmitted: true,
+		},
+		{
+			name:      "gemini-4-argon maps medium to thinkingLevel",
+			svc:       &Service{Model: "gemini-4-argon", APIKey: "x", ThinkingLevel: llm.ThinkingLevelMedium},
+			wantLevel: "medium",
+		},
+		{
+			name:      "ReasoningEffort overrides ThinkingLevel for 4.x",
+			svc:       &Service{Model: "gemini-4-argon", APIKey: "x", ThinkingLevel: llm.ThinkingLevelLow, ReasoningEffort: "high"},
+			wantLevel: "high",
+		},
+		{
 			name:      "ReasoningEffort overrides ThinkingLevel for 3.x",
 			svc:       &Service{Model: "gemini-3-flash-preview", APIKey: "x", ThinkingLevel: llm.ThinkingLevelMedium, ReasoningEffort: "high"},
 			wantLevel: "high",
@@ -1362,6 +1377,7 @@ func TestSupportedReasoningLevelsFromModelsDev(t *testing.T) {
 	}{
 		{model: "gemini-3-flash-preview", want: "minimal,low,medium,high"},
 		{model: "gemini-3.1-pro-preview", want: "low,medium,high"},
+		{model: "gemini-4-argon", want: "low,medium,high"},
 		{model: "gemini-2.5-pro", want: ""},
 	}
 	for _, tt := range tests {
@@ -1394,6 +1410,15 @@ func TestThinkingConfigRequestOverride(t *testing.T) {
 		{name: "req medium on 3.1-pro", svc: &Service{Model: "gemini-3.1-pro-preview", APIKey: "x"}, reqLevel: llm.ThinkingLevelMedium, wantLevel: "medium"},
 		{name: "req off on 3-flash rounds to minimal", svc: &Service{Model: "gemini-3-flash-preview", APIKey: "x", ThinkingLevel: llm.ThinkingLevelMedium}, reqLevel: llm.ThinkingLevelOff, wantLevel: "minimal"},
 		{name: "req beats verbatim", svc: &Service{Model: "gemini-3-flash-preview", APIKey: "x", ReasoningEffort: "medium"}, reqLevel: llm.ThinkingLevelHigh, wantLevel: "high"},
+		{name: "req default on 4-argon omitted", svc: &Service{Model: "gemini-4-argon", APIKey: "x"}, reqLevel: llm.ThinkingLevelDefault, wantOmitted: true},
+		{name: "req off on 4-argon clamps to low without thoughts", svc: &Service{Model: "gemini-4-argon", APIKey: "x", ThinkingLevel: llm.ThinkingLevelMedium}, reqLevel: llm.ThinkingLevelOff, wantLevel: "low"},
+		{name: "req minimal on 4-argon clamps to low", svc: &Service{Model: "gemini-4-argon", APIKey: "x"}, reqLevel: llm.ThinkingLevelMinimal, wantLevel: "low"},
+		{name: "req minimal on unlisted gemini-4 clamps to low", svc: &Service{Model: "gemini-4-argon-cyber-permissive", APIKey: "x"}, reqLevel: llm.ThinkingLevelMinimal, wantLevel: "low"},
+		{name: "req low on 4-argon", svc: &Service{Model: "gemini-4-argon", APIKey: "x"}, reqLevel: llm.ThinkingLevelLow, wantLevel: "low"},
+		{name: "req medium on 4-argon", svc: &Service{Model: "gemini-4-argon", APIKey: "x"}, reqLevel: llm.ThinkingLevelMedium, wantLevel: "medium"},
+		{name: "req high on 4-argon", svc: &Service{Model: "gemini-4-argon", APIKey: "x"}, reqLevel: llm.ThinkingLevelHigh, wantLevel: "high"},
+		{name: "req xhigh on 4-argon clamps to high", svc: &Service{Model: "gemini-4-argon", APIKey: "x"}, reqLevel: llm.ThinkingLevelXHigh, wantLevel: "high"},
+		{name: "req max on 4-argon clamps to high", svc: &Service{Model: "gemini-4-argon", APIKey: "x"}, reqLevel: llm.ThinkingLevelMax, wantLevel: "high"},
 		{name: "req low on 2.5", svc: &Service{Model: "gemini-2.5-pro", APIKey: "x"}, reqLevel: llm.ThinkingLevelLow, wantBudget: ptr(2048)},
 		{name: "req off on 2.5 zero budget", svc: &Service{Model: "gemini-2.5-pro", APIKey: "x", ThinkingLevel: llm.ThinkingLevelMedium}, reqLevel: llm.ThinkingLevelOff, wantBudget: ptr(0)},
 	}

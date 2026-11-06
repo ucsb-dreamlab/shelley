@@ -1020,6 +1020,9 @@ func (s *reasoningService) mapRequest(req *llm.Request) (*llm.Request, error) {
 	} else if len(s.mapping) > 0 {
 		mapped, ok := s.mapping[copyReq.ThinkingLevel]
 		if !ok {
+			if copyReq.ThinkingLevel == llm.ThinkingLevelOff {
+				return &copyReq, nil
+			}
 			return nil, fmt.Errorf("reasoning level %q is not supported by this model", copyReq.ThinkingLevel.Name())
 		}
 		copyReq.ThinkingLevel = mapped.level

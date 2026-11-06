@@ -34,7 +34,7 @@ type Service struct {
 	ThinkingLevel llm.ThinkingLevel // service-level default; zero (ThinkingLevelDefault) leaves thinkingConfig at the model default
 
 	// ReasoningEffort, if non-empty, is used as the thinkingConfig.thinkingLevel
-	// value sent to Gemini 3.x verbatim, overriding ThinkingLevel. Ignored for
+	// value sent to Gemini 3.x+ verbatim, overriding ThinkingLevel. Ignored for
 	// Gemini 2.5 (which uses thinkingBudget). This mirrors oai.ResponsesService
 	// so custom-model configurations can pass provider-specific values through
 	// without Shelley needing to know them.
@@ -382,7 +382,7 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 //
 // Precedence:
 //  1. req.ThinkingLevel (request-level override)
-//  2. s.ReasoningEffort (verbatim per-model config; Gemini 3.x only)
+//  2. s.ReasoningEffort (verbatim per-model config; Gemini 3.x+ only)
 //  3. s.ThinkingLevel (service-level default)
 //
 // Returns nil when no thinking config should be sent (use the model default).
@@ -392,13 +392,17 @@ func (s *Service) thinkingConfig(req *llm.Request) *gemini.ThinkingConfig {
 		reqLevel = req.ThinkingLevel
 	}
 	level := llm.EffectiveThinkingLevel(s.ThinkingLevel, reqLevel)
-	if level == llm.ThinkingLevelDefault && s.ReasoningEffort == "" {
+	if level == llm.ThinkingLevelDefault && s.ReasoningEffort == "" && (req == nil || req.ReasoningEffort == "") {
 		return nil
 	}
 
 	model := cmp.Or(s.Model, DefaultModel)
-	if strings.HasPrefix(model, "gemini-3") {
-		caps, found := modelsdev.LookupReasoningCapabilities(s.URL, model)
+	bareModel := model
+	if i := strings.LastIndex(bareModel, "/"); i >= 0 {
+		bareModel = bareModel[i+1:]
+	}
+	caps, found := modelsdev.LookupReasoningCapabilities(s.URL, model)
+	if strings.HasPrefix(bareModel, "gemini-3") || strings.HasPrefix(bareModel, "gemini-4") || (found && len(caps.Levels) > 0) {
 		var effort string
 		genericLevel := llm.ThinkingLevelDefault
 		switch {
@@ -417,13 +421,18 @@ func (s *Service) thinkingConfig(req *llm.Request) *gemini.ThinkingConfig {
 				genericLevel = llm.ClampThinkingLevel(genericLevel, caps.Levels)
 			}
 			if genericLevel == llm.ThinkingLevelOff {
-				// Historical fallback: Gemini 3 has no explicit off value.
+				// Historical fallback: Gemini 3/4 has no explicit off value.
 				effort = "low"
 			} else {
 				effort = genericLevel.ThinkingEffort()
 			}
-			if len(caps.Levels) == 0 && (effort == "xhigh" || effort == "max") {
-				effort = "high"
+			if len(caps.Levels) == 0 {
+				if effort == "xhigh" || effort == "max" {
+					effort = "high"
+				} else if effort == "minimal" && strings.HasPrefix(bareModel, "gemini-4") {
+					// Gemini 4 only accepts low/medium/high and rejects minimal with HTTP 400.
+					effort = "low"
+				}
 			}
 		}
 		if effort == "" {

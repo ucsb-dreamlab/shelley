@@ -895,10 +895,19 @@ func (s *captureThinkingService) Do(_ context.Context, req *llm.Request) (*llm.R
 }
 
 func TestReasoningServiceRejectsUnsupportedLevel(t *testing.T) {
-	svc := WrapReasoningConfig(&captureThinkingService{}, "", "unknown", "yes", `{"low":"low"}`)
+	capture := &captureThinkingService{}
+	svc := WrapReasoningConfig(capture, "", "unknown", "yes", `{"low":"low"}`)
 	_, err := svc.Do(t.Context(), &llm.Request{ThinkingLevel: llm.ThinkingLevelHigh})
 	if err == nil || !strings.Contains(err.Error(), "not supported") {
 		t.Fatalf("error = %v, want unsupported-level error", err)
+	}
+	// Internal ThinkingLevelOff requests (e.g. workhorse slug generation) must
+	// still reach the adapter even when "off" is omitted from reasoning_map.
+	if _, err := svc.Do(t.Context(), &llm.Request{ThinkingLevel: llm.ThinkingLevelOff}); err != nil {
+		t.Fatalf("ThinkingLevelOff error = %v, want nil", err)
+	}
+	if capture.got != llm.ThinkingLevelOff {
+		t.Fatalf("got = %s, want off", capture.got.Name())
 	}
 }
 

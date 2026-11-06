@@ -132,11 +132,11 @@ type GenerationConfig struct {
 
 // ThinkingConfig controls extended thinking for Gemini models.
 // ThinkingLevel and ThinkingBudget are mutually exclusive: setting both
-// returns a 400 from the API. Use ThinkingLevel for Gemini 3.x and
+// returns a 400 from the API. Use ThinkingLevel for Gemini 3.x+ and
 // ThinkingBudget for Gemini 2.5.
 // https://ai.google.dev/gemini-api/docs/thinking
 type ThinkingConfig struct {
-	ThinkingLevel   string `json:"thinkingLevel,omitempty"`   // Gemini 3.x: "minimal", "low", "medium", "high"
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`   // Gemini 3.x/4.x: "minimal", "low", "medium", "high"
 	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`  // Gemini 2.5: token count, -1 dynamic, 0 disable
 	IncludeThoughts bool   `json:"includeThoughts,omitempty"` // include thought summaries in response
 }
