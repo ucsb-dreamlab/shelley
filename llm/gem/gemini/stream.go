@@ -88,6 +88,9 @@ func parseStreamResponse(ctx context.Context, r io.Reader, onStream func(llm.Str
 				if err := ctx.Err(); err != nil {
 					return err
 				}
+				if part.IsOrphanedSignature() {
+					continue
+				}
 				if !part.IsText() && part.FunctionCall == nil && part.ToolCall == nil && part.ToolResponse == nil {
 					return fmt.Errorf("unsupported Gemini stream part")
 				}
