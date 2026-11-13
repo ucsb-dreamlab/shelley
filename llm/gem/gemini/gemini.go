@@ -69,6 +69,7 @@ type Content struct {
 // This is a union data structure, only one-of the fields can be set.
 type Part struct {
 	raw                 json.RawMessage
+	orphanedSignature   bool
 	Text                string               `json:"text,omitempty"`
 	FunctionCall        *FunctionCall        `json:"functionCall,omitempty"`
 	FunctionResponse    *FunctionResponse    `json:"functionResponse,omitempty"`
@@ -91,9 +92,36 @@ type Part struct {
 }
 
 func (p Part) IsText() bool {
-	return p.FunctionCall == nil && p.FunctionResponse == nil &&
+	return !p.orphanedSignature && p.FunctionCall == nil && p.FunctionResponse == nil &&
 		p.ToolCall == nil && p.ToolResponse == nil &&
 		p.ExecutableCode == nil && p.CodeExecutionResult == nil && p.InlineData == nil
+}
+
+// IsOrphanedSignature reports whether the decoded JSON part carried a
+// thoughtSignature without any union payload field (for example when Vertex AI
+// or a proxy omits server-side toolCall/toolResponse payloads).
+func (p Part) IsOrphanedSignature() bool {
+	return p.orphanedSignature
+}
+
+// WithThoughtSignature returns a copy of p with ThoughtSignature set to sig,
+// updating preserved raw server-tool JSON when present.
+func (p Part) WithThoughtSignature(sig string) Part {
+	p.ThoughtSignature = sig
+	if len(p.raw) != 0 {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(p.raw, &fields); err == nil {
+			if sig == "" {
+				delete(fields, "thoughtSignature")
+			} else if encoded, err := json.Marshal(sig); err == nil {
+				fields["thoughtSignature"] = encoded
+			}
+			if updated, err := json.Marshal(fields); err == nil {
+				p.raw = updated
+			}
+		}
+	}
+	return p
 }
 
 func (p Part) MarshalJSON() ([]byte, error) {
@@ -120,6 +148,14 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 	*p = Part(decoded)
 	if p.ToolCall != nil || p.ToolResponse != nil {
 		p.raw = append(json.RawMessage(nil), data...)
+		return nil
+	}
+	if p.Text == "" && !p.Thought && p.ThoughtSignature != "" && p.IsText() {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err == nil {
+			_, hasText := fields["text"]
+			p.orphanedSignature = !hasText
+		}
 	}
 	return nil
 }

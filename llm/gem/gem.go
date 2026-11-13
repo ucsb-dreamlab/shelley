@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -20,6 +21,11 @@ const (
 	DefaultModel     = "gemini-3.8-flash"
 	DefaultMaxTokens = 16384
 	GeminiAPIKeyEnv  = "GEMINI_API_KEY"
+
+	// skipThoughtSignatureValidator is Google's documented base64("skip_thought_signature_validator")
+	// placeholder for replaying tool calls whose original thoughtSignature came from
+	// another provider/backend or was rejected.
+	skipThoughtSignatureValidator = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="
 )
 
 // Service provides Gemini completions.
@@ -131,12 +137,17 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 		}
 
 		// Map each content item to Gemini's format
+		foreignToolSigned := false
 		for _, c := range msg.Content {
 			if msg.Origin.Known() && msg.Origin.Provider != "gemini" {
 				if c.Type == llm.ContentTypeThinking || c.Type == llm.ContentTypeRedactedThinking {
 					continue
 				}
 				c.Signature = ""
+				if c.Type == llm.ContentTypeToolUse && !foreignToolSigned && s.SupportsServerSideWebSearch() {
+					c.Signature = skipThoughtSignatureValidator
+					foreignToolSigned = true
+				}
 			}
 			if len(c.GeminiServerTool) != 0 {
 				var part gemini.Part
@@ -316,7 +327,7 @@ func (s *Service) buildGeminiRequest(req *llm.Request) (*gemini.Request, error) 
 		if search {
 			gemReq.Tools = append(gemReq.Tools, gemini.Tool{GoogleSearch: &struct{}{}})
 			gemReq.ToolConfig = &gemini.ToolConfig{
-				IncludeServerSideToolInvocations: true,
+				IncludeServerSideToolInvocations: s.supportsServerSideToolInvocations(),
 				FunctionCallingConfig:            &gemini.FunctionCallingConfig{Mode: "VALIDATED"},
 			}
 		}
@@ -521,6 +532,87 @@ func (s *Service) SupportsServerSideWebSearch() bool {
 		strings.HasPrefix(model, "gemini-4-") || strings.HasPrefix(model, "gemini-4.")
 }
 
+// supportsServerSideToolInvocations reports whether the configured endpoint is
+// Google's Gemini Developer API. Vertex AI (and proxies like LiteLLM backed by
+// Vertex AI) do not emit Part.toolCall/toolResponse for server-side tools and
+// instead leak bare thoughtSignature parts that fail validation on replay.
+func (s *Service) supportsServerSideToolInvocations() bool {
+	u, err := url.Parse(cmp.Or(s.URL, gemini.DefaultEndpoint))
+	return err == nil && u.Scheme == "https" &&
+		strings.EqualFold(u.Hostname(), "generativelanguage.googleapis.com")
+}
+
+func invalidThoughtSignatureError(apiErr *gemini.APIError) bool {
+	if apiErr == nil || apiErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(apiErr.Body)
+	return strings.Contains(lower, "thought signature") || strings.Contains(lower, "thought_signature")
+}
+
+func sanitizeThoughtSignatures(req *gemini.Request) (*gemini.Request, bool) {
+	if req == nil || len(req.Contents) == 0 {
+		return req, false
+	}
+	changed := false
+	contents := make([]gemini.Content, len(req.Contents))
+	for i, content := range req.Contents {
+		if content.Role != "model" {
+			contents[i] = content
+			continue
+		}
+		var parts []gemini.Part
+		seenFunctionCall := false
+		for _, part := range content.Parts {
+			switch {
+			case part.IsOrphanedSignature():
+				changed = true
+				continue
+			case part.IsText():
+				if part.Text == "" && part.ThoughtSignature != "" {
+					changed = true
+					continue
+				}
+				if part.ThoughtSignature != "" {
+					part.ThoughtSignature = ""
+					changed = true
+				}
+				parts = append(parts, part)
+			case part.FunctionCall != nil:
+				if !seenFunctionCall {
+					seenFunctionCall = true
+					if part.ThoughtSignature != skipThoughtSignatureValidator {
+						part.ThoughtSignature = skipThoughtSignatureValidator
+						changed = true
+					}
+				} else if part.ThoughtSignature != "" && part.ThoughtSignature != skipThoughtSignatureValidator {
+					part.ThoughtSignature = skipThoughtSignatureValidator
+					changed = true
+				}
+				parts = append(parts, part)
+			case part.ToolCall != nil || part.ToolResponse != nil:
+				if part.ThoughtSignature != "" && part.ThoughtSignature != skipThoughtSignatureValidator {
+					part = part.WithThoughtSignature(skipThoughtSignatureValidator)
+					changed = true
+				}
+				parts = append(parts, part)
+			default:
+				parts = append(parts, part)
+			}
+		}
+		if len(parts) == 0 && len(content.Parts) > 0 {
+			parts = []gemini.Part{{Text: ""}}
+		}
+		contents[i] = gemini.Content{Role: content.Role, Parts: parts}
+	}
+	if !changed {
+		return req, false
+	}
+	clone := *req
+	clone.Contents = contents
+	return &clone, true
+}
+
 // DefaultReasoningLevel reports the effective configured level, or the documented
 // model default. Dynamic and unknown defaults return "".
 func (s *Service) DefaultReasoningLevel() string {
@@ -673,6 +765,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 	endTime := startTime // Initialize endTime
 	var gemRes *gemini.Response
 
+	sanitizedSignatures := false
 	const maxAttempts = 16
 	for attempts := 0; attempts < maxAttempts; attempts++ {
 		gemApiErr := error(nil)
@@ -688,13 +781,23 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			break
 		}
 
+		var apiErr *gemini.APIError
+		if !sanitizedSignatures && errors.As(gemApiErr, &apiErr) && invalidThoughtSignatureError(apiErr) {
+			if sanitized, changed := sanitizeThoughtSignatures(gemReq); changed {
+				slog.WarnContext(ctx, "gemini_invalid_thought_signature, retrying with sanitized signatures",
+					"error", gemApiErr.Error(), "model", s.Model)
+				sanitizedSignatures = true
+				gemReq = sanitized
+				continue
+			}
+		}
+
 		if attempts == maxAttempts-1 {
 			// We've exhausted all retry attempts
 			return nil, fmt.Errorf("gemini: API error after %d attempts (last at %s): %w", attempts+1, time.Now().Format(time.DateTime), gemApiErr)
 		}
 
 		// Check if the error is retryable (server error or rate limiting).
-		var apiErr *gemini.APIError
 		retryable := errors.As(gemApiErr, &apiErr) && (apiErr.StatusCode == 429 || apiErr.StatusCode >= 500)
 		if !retryable {
 			return nil, fmt.Errorf("gemini: API error: %w", gemApiErr)

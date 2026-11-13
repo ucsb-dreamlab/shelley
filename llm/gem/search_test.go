@@ -30,6 +30,16 @@ func TestGroundedSearchRequest(t *testing.T) {
 		got.ToolConfig.FunctionCallingConfig == nil || got.ToolConfig.FunctionCallingConfig.Mode != "VALIDATED" {
 		t.Fatalf("missing mixed-tool config: %+v", got.ToolConfig)
 	}
+	s.URL = "https://litellm.example.com/v1beta"
+	gotProxy, err := s.buildGeminiRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotProxy.ToolConfig == nil || gotProxy.ToolConfig.IncludeServerSideToolInvocations ||
+		gotProxy.ToolConfig.FunctionCallingConfig == nil || gotProxy.ToolConfig.FunctionCallingConfig.Mode != "VALIDATED" {
+		t.Fatalf("proxy endpoint must omit includeServerSideToolInvocations: %+v", gotProxy.ToolConfig)
+	}
+	s.URL = ""
 	s.Model = "gemini-2.5-pro"
 	if _, err := s.buildGeminiRequest(req); err == nil {
 		t.Fatal("unsupported mixed search must fail")
@@ -190,5 +200,121 @@ func TestGroundedSearchToolTurn(t *testing.T) {
 	}
 	if len(cites) != 1 || cites[0].EndUTF16 != 16 || answer.Signature != "answer-signature" || answer.Text != candidate.Content.Parts[3].Text || answer.GoogleSearchSuggestions != "" {
 		t.Fatalf("incorrect grounded answer: %+v", answer)
+	}
+}
+
+func TestGroundedSearchStrippedServerToolPartsAndVertexPartIndex(t *testing.T) {
+	body := geminiSSE(
+		`{"candidates":[{"content":{"parts":[{"thoughtSignature":"CAIS-search-call"}]}}]}`,
+		`{"candidates":[{"content":{"parts":[{"thoughtSignature":"CAIS-search-resp"}]}}]}`,
+		`{"candidates":[{"content":{"parts":[{"text":"Checking results.","thought":true}]}}]}`,
+		`{"candidates":[{"content":{"parts":[{"text":"Paris hosted."}]}}]}`,
+		`{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","name":"bash","args":{"command":"echo ok"}},"thoughtSignature":"AY89-fn"}]},"finishReason":"STOP","groundingMetadata":{"groundingChunks":[{"web":{"uri":"https://example.org/paris","title":"Paris"}}],"groundingSupports":[{"segment":{"endIndex":13,"text":"Paris hosted."},"groundingChunkIndices":[0]}]}}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3}}`,
+	)
+	s := &Service{Model: "gemini-4-hydrogen", URL: "https://litellm.example.com/v1beta", APIKey: "key", HTTPC: &http.Client{
+		Transport: &mockRoundTripper{response: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}},
+	}}
+	response, err := s.Do(t.Context(), &llm.Request{Messages: []llm.Message{llm.UserStringMessage("Search")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := response.ToMessage()
+	if len(msg.Content) != 3 || msg.Content[0].Type != llm.ContentTypeThinking ||
+		msg.Content[1].Type != llm.ContentTypeText || msg.Content[1].Text != "Paris hosted." || len(msg.Content[1].Citations) == 0 ||
+		msg.Content[2].Type != llm.ContentTypeToolUse || msg.Content[2].Signature != "AY89-fn" {
+		t.Fatalf("unexpected converted content: %+v", msg.Content)
+	}
+	replay, err := s.buildGeminiRequest(&llm.Request{Messages: []llm.Message{msg}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range replay.Contents[0].Parts {
+		if strings.HasPrefix(p.ThoughtSignature, "CAIS") {
+			t.Fatalf("orphaned server-tool signature leaked into replay: %+v", p)
+		}
+	}
+}
+
+func TestInvalidThoughtSignatureRetry(t *testing.T) {
+	calls := 0
+	var seenRequests []gemini.Request
+	s := &Service{
+		Model:  "gemini-4-hydrogen",
+		URL:    "https://litellm.example.com/v1beta",
+		APIKey: "key",
+		HTTPC: &http.Client{Transport: streamRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			var req gemini.Request
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			seenRequests = append(seenRequests, req)
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"Invalid thought signature.","status":"INVALID_ARGUMENT"}}`)),
+				}, nil
+			}
+			okSSE := geminiSSE(`{"candidates":[{"content":{"parts":[{"text":"Recovered."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2}}`)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(okSSE)),
+			}, nil
+		})},
+	}
+	corrupted := llm.Message{
+		Role:   llm.MessageRoleAssistant,
+		Origin: &llm.MessageOrigin{Provider: "gemini", Transport: "gemini-generate-content", Model: "gemini-4-hydrogen"},
+		Content: []llm.Content{
+			{Type: llm.ContentTypeText, Text: "", Signature: "CAIS-corrupted-1"},
+			{Type: llm.ContentTypeText, Text: "", Signature: "CAIS-corrupted-2"},
+			{Type: llm.ContentTypeText, Text: "Checking.", Signature: "AY89-text"},
+			{ID: "call_1", Type: llm.ContentTypeToolUse, ToolName: "bash", ToolInput: json.RawMessage(`{"command":"pwd"}`), Signature: "AY89-stale"},
+		},
+	}
+	toolRes := llm.Message{
+		Role: llm.MessageRoleUser,
+		Content: []llm.Content{{
+			Type: llm.ContentTypeToolResult, ToolUseID: "call_1", ToolName: "bash",
+			ToolResult: []llm.Content{{Type: llm.ContentTypeText, Text: "/tmp"}},
+		}},
+	}
+	res, err := s.Do(t.Context(), &llm.Request{Messages: []llm.Message{llm.UserStringMessage("go"), corrupted, toolRes}})
+	if err != nil {
+		t.Fatalf("expected signature recovery, got error: %v", err)
+	}
+	if calls != 2 || res.Content[0].Text != "Recovered." {
+		t.Fatalf("calls = %d, content = %+v", calls, res.Content)
+	}
+	retriedParts := seenRequests[1].Contents[1].Parts
+	if len(retriedParts) != 2 || retriedParts[0].Text != "Checking." || retriedParts[0].ThoughtSignature != "" ||
+		retriedParts[1].FunctionCall == nil || retriedParts[1].ThoughtSignature != skipThoughtSignatureValidator {
+		t.Fatalf("unexpected sanitized parts on retry: %+v", retriedParts)
+	}
+}
+
+func TestGroundedSearchForeignToolUseSignature(t *testing.T) {
+	s := &Service{Model: "gemini-4-argon"}
+	req := &llm.Request{Messages: []llm.Message{{
+		Role:   llm.MessageRoleAssistant,
+		Origin: &llm.MessageOrigin{Provider: "anthropic", Transport: "anthropic-messages", Model: "claude-sonnet-4.5"},
+		Content: []llm.Content{
+			{ID: "call_1", Type: llm.ContentTypeToolUse, ToolName: "bash", ToolInput: json.RawMessage(`{"command":"pwd"}`), Signature: "foreign"},
+			{ID: "call_2", Type: llm.ContentTypeToolUse, ToolName: "bash", ToolInput: json.RawMessage(`{"command":"ls"}`), Signature: "foreign"},
+		},
+	}}}
+	got, err := s.buildGeminiRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := got.Contents[0].Parts
+	if len(parts) != 2 || parts[0].ThoughtSignature != skipThoughtSignatureValidator || parts[1].ThoughtSignature != "" {
+		t.Fatalf("foreign tool calls must carry placeholder signature on first call: %+v", parts)
 	}
 }

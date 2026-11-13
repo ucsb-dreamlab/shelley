@@ -72,14 +72,30 @@ func convertSearchResponse(res *gemini.Response) ([]llm.Content, error) {
 			return nil, fmt.Errorf("Gemini grounding support has no segment")
 		}
 		segment := support.Segment
-		if segment.PartIndex < 0 || segment.PartIndex >= len(partTargets) {
-			return nil, fmt.Errorf("Gemini grounding part %d out of range", segment.PartIndex)
+		target := -1
+		if segment.PartIndex >= 0 && segment.PartIndex < len(partTargets) {
+			if part := candidate.Content.Parts[segment.PartIndex]; part.IsText() && !part.Thought && part.Text != "" {
+				target = partTargets[segment.PartIndex]
+			}
 		}
-		part := candidate.Content.Parts[segment.PartIndex]
-		if !part.IsText() || part.Thought || part.Text == "" {
+		// Vertex AI indexes grounding segments relative to non-thought answer parts
+		// rather than raw candidate parts; resolve against answerParts when the quoted
+		// segment text matches.
+		if target < 0 && segment.Text != "" && segment.PartIndex >= 0 && segment.PartIndex < len(answerParts) {
+			candidateTarget := answerParts[segment.PartIndex]
+			candidateText := content[candidateTarget].Text
+			if segment.StartIndex >= 0 && segment.EndIndex > segment.StartIndex &&
+				segment.EndIndex <= len(candidateText) &&
+				candidateText[segment.StartIndex:segment.EndIndex] == segment.Text {
+				target = candidateTarget
+			}
+		}
+		if target < 0 {
+			if segment.PartIndex < 0 || segment.PartIndex >= len(partTargets) {
+				return nil, fmt.Errorf("Gemini grounding part %d out of range", segment.PartIndex)
+			}
 			return nil, fmt.Errorf("Gemini grounding part %d is not answer text", segment.PartIndex)
 		}
-		target := partTargets[segment.PartIndex]
 		text := content[target].Text
 		if segment.StartIndex < 0 || segment.EndIndex <= segment.StartIndex || segment.EndIndex > len(text) || !utf8.ValidString(text[segment.StartIndex:segment.EndIndex]) {
 			return nil, fmt.Errorf("invalid Gemini grounding byte range [%d,%d) for text part %d", segment.StartIndex, segment.EndIndex, segment.PartIndex)

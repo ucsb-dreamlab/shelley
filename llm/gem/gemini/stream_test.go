@@ -263,4 +263,36 @@ func TestPartJSONPayload(t *testing.T) {
 			t.Errorf("part = %#v, want %#v", replay, part)
 		}
 	}
+
+	var orphaned Part
+	if err := json.Unmarshal([]byte(`{"thoughtSignature":"CAIS-server-tool"}`), &orphaned); err != nil {
+		t.Fatal(err)
+	}
+	if !orphaned.IsOrphanedSignature() || orphaned.IsText() {
+		t.Fatalf("payload-less signature part misclassified as text: %#v", orphaned)
+	}
+}
+
+func TestGenerateContentSSESkipsOrphanedSignatureParts(t *testing.T) {
+	body := streamData(
+		`{"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"CAIS-call"}]}}]}`,
+		`{"candidates":[{"content":{"parts":[{"thoughtSignature":"CAIS-resp"}]}}]}`,
+		`{"candidates":[{"content":{"parts":[{"text":"Answer."}]}}]}`,
+		`{"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"AY89-tail"}]}}]}`,
+		`{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","name":"bash","args":{"command":"pwd"}},"thoughtSignature":"AY89-fn"}]}}]}`,
+		`{"candidates":[{"finishReason":"STOP"}]}`,
+		`{"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}}`,
+	)
+	response, err := streamModel(strings.NewReader(body)).GenerateContent(t.Context(), &Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantParts := []Part{
+		{Text: "Answer."},
+		{ThoughtSignature: "AY89-tail"},
+		{FunctionCall: &FunctionCall{ID: "call_1", Name: "bash", Args: map[string]any{"command": "pwd"}}, ThoughtSignature: "AY89-fn"},
+	}
+	if got := response.Candidates[0].Content.Parts; !reflect.DeepEqual(got, wantParts) {
+		t.Fatalf("parts = %#v, want %#v", got, wantParts)
+	}
 }
