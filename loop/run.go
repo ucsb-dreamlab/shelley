@@ -362,6 +362,7 @@ func (l *RunConfig) doWithRetry(ctx context.Context, req *llm.Request) (*llm.Res
 			"max_retries", maxRetries)
 		select {
 		case <-time.After(sleep):
+			llm.ReportProgress(ctx)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

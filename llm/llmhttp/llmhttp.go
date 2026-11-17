@@ -161,7 +161,7 @@ func (e *idleTimeoutError) RequestErrorInfo() llm.RequestErrorInfo {
 // between bytes (including time-to-first-byte), not the total duration of a
 // turn: a slow-but-progressing stream (e.g. a long high-reasoning response)
 // runs to completion as long as it keeps making progress.
-const DefaultIdleTimeout = 3 * time.Minute
+const DefaultIdleTimeout = 5 * time.Minute
 
 // Transport wraps an http.RoundTripper to add Shelley-specific headers,
 // enforce an idle/stall timeout on the response body, and record exchanges.

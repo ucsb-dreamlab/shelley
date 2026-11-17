@@ -980,6 +980,8 @@ func (s *reasoningService) mapRequest(req *llm.Request) (*llm.Request, error) {
 		if mapped, ok := s.mapping[s.defaultSource]; ok {
 			copyReq.ThinkingLevel = mapped.level
 			copyReq.ReasoningEffort = mapped.effort
+		} else if _, native := s.Service.(*gem.Service); native && s.defaultSource != llm.ThinkingLevelDefault && s.defaultSource != llm.ThinkingLevelOff {
+			copyReq.ThinkingLevel = s.defaultSource
 		}
 	} else if len(s.mapping) > 0 {
 		mapped, ok := s.mapping[copyReq.ThinkingLevel]
@@ -1013,6 +1015,19 @@ func WrapReasoningConfig(service llm.Service, endpoint, modelName, support, rawM
 		}
 		if identity {
 			mapping, levels = nil, nil
+		} else if len(mapping) > 0 && len(native.SupportedReasoningLevels()) > 0 {
+			// Ignore a legacy all-"default" map on models with known native controls
+			// so Gemini still receives an explicit thinkingLevel + includeThoughts.
+			allDefault := true
+			for _, mapped := range mapping {
+				if mapped.level != llm.ThinkingLevelDefault || mapped.effort != "" {
+					allDefault = false
+					break
+				}
+			}
+			if allDefault {
+				mapping, levels = nil, nil
+			}
 		}
 		if len(native.SupportedReasoningLevels()) == 0 {
 			for level, mapped := range mapping {

@@ -584,6 +584,8 @@ func TestCustomGeminiModelThinkingControls(t *testing.T) {
 		{"models/gemini-4-argon", ""},
 		{"gemini-flash-latest", ""},
 		{"gemini-4-argon", identityReasoningMap},
+		{"gemini-4-argon", `{"low":"default","medium":"default","high":"default"}`},
+		{"gemini-4-carbon", `{"low":"default","medium":"default","high":"default"}`},
 	} {
 		modelName := tt.model
 		t.Run(modelName+"/"+tt.mapping, func(t *testing.T) {
@@ -591,8 +593,9 @@ func TestCustomGeminiModelThinkingControls(t *testing.T) {
 				GenerationConfig struct {
 					MaxOutputTokens int `json:"maxOutputTokens"`
 					ThinkingConfig  struct {
-						ThinkingLevel  string `json:"thinkingLevel"`
-						ThinkingBudget *int   `json:"thinkingBudget"`
+						ThinkingLevel   string `json:"thinkingLevel"`
+						ThinkingBudget  *int   `json:"thinkingBudget"`
+						IncludeThoughts bool   `json:"includeThoughts"`
 					} `json:"thinkingConfig"`
 				} `json:"generationConfig"`
 			}
@@ -641,8 +644,16 @@ func TestCustomGeminiModelThinkingControls(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := (<-captured).GenerationConfig
-			if got.MaxOutputTokens != 65536 || got.ThinkingConfig.ThinkingLevel != "low" || got.ThinkingConfig.ThinkingBudget != nil {
+			if got.MaxOutputTokens != 65536 || got.ThinkingConfig.ThinkingLevel != "low" || !got.ThinkingConfig.IncludeThoughts || got.ThinkingConfig.ThinkingBudget != nil {
 				t.Errorf("wrong native controls through model manager: %+v", got)
+			}
+			// Default request thinking level must also send the model's default thinkingLevel + includeThoughts.
+			if _, err := service.Do(t.Context(), simpleRequest()); err != nil {
+				t.Fatal(err)
+			}
+			gotDefault := (<-captured).GenerationConfig
+			if gotDefault.ThinkingConfig.ThinkingLevel != "high" || !gotDefault.ThinkingConfig.IncludeThoughts {
+				t.Errorf("default request thinkingConfig = %+v, want thinkingLevel=high includeThoughts=true", gotDefault.ThinkingConfig)
 			}
 		})
 	}

@@ -30,6 +30,13 @@ type modelThinkingCapabilities struct {
 
 func (s *Service) thinkingCapabilities() (modelThinkingCapabilities, bool) {
 	caps, found := modelsdev.LookupGeminiReasoningCapabilities(s.modelName())
+	if !found && (strings.HasPrefix(s.modelKey(), "gemini-4-") || strings.HasPrefix(s.modelKey(), "gemini-4.")) {
+		caps = modelsdev.ReasoningCapabilities{
+			Supported: true,
+			Levels:    []llm.ThinkingLevel{llm.ThinkingLevelLow, llm.ThinkingLevelMedium, llm.ThinkingLevelHigh},
+		}
+		found = true
+	}
 	result := modelThinkingCapabilities{ReasoningCapabilities: caps}
 	switch s.modelKey() {
 	case "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite":

@@ -131,3 +131,51 @@ func TestOverlongTurnAborts(t *testing.T) {
 		}
 	})
 }
+// A retryable failure after a long silent wait resets the stall timer for the
+// retry attempt so Attempt 2 gets a full stallTimeout window.
+func TestRetryResetsStallTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		attempts := 0
+		svc := &funcLLM{do: func(ctx context.Context, _ *llm.Request) (*llm.Response, error) {
+			attempts++
+			if attempts == 1 {
+				select {
+				case <-time.After(3 * time.Minute):
+					return nil, newIdleStallError(3 * time.Minute)
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			select {
+			case <-time.After(4 * time.Minute):
+				llm.ReportProgress(ctx)
+				return &llm.Response{
+					Role:       llm.MessageRoleAssistant,
+					StopReason: llm.StopReasonEndTurn,
+					Content:    []llm.Content{{Type: llm.ContentTypeText, Text: "done after retry"}},
+				}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}}
+		recorded, err := runStallTurn(t, svc)
+		if err != nil {
+			t.Fatalf("ProcessOneTurn: %v", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts)
+		}
+		if len(recorded) != 1 || recorded[0].Content[0].Text != "done after retry" {
+			t.Fatalf("recorded = %+v, want final answer from retry", recorded)
+		}
+	})
+}
+
+type funcLLM struct {
+	progressLLM
+	do func(context.Context, *llm.Request) (*llm.Response, error)
+}
+
+func (f *funcLLM) Do(ctx context.Context, req *llm.Request) (*llm.Response, error) {
+	return f.do(ctx, req)
+}
